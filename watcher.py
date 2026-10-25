@@ -157,7 +157,7 @@ class Amazon:
         except Exception as e:  # network error
             log(f"  network error on {url}: {e}")
             status, text = 0, ""
-        if status in (0, 429, 503) or (status != 404 and any(m in text for m in CAPTCHA_MARKERS)):
+        if status in (0, 429, 503) or any(m in text for m in CAPTCHA_MARKERS):
             log(f"  blocked/captcha (status {status}) on {url} - stopping this run")
             raise Blocked(url)
         return status, text
@@ -184,12 +184,7 @@ class Amazon:
         status, text = self.get("/s?k=" + urllib.parse.quote_plus(query))
         if status != 200:
             return []
-        soup = BeautifulSoup(text, "lxml")
-        results = parse_search(soup)
-        if not results:
-            t = clean(soup.title.get_text()) if soup.title else ""
-            log(f"  search page had no results ({len(text)} bytes, title: {t[:80]})")
-        return results
+        return parse_search(BeautifulSoup(text, "lxml"))
 
 
 def first_text(soup: BeautifulSoup, selectors: list[str]) -> str:
@@ -249,8 +244,7 @@ def parse_product(soup: BeautifulSoup) -> dict:
 
 def parse_search(soup: BeautifulSoup) -> list[dict]:
     results = []
-    cards = soup.select('div[data-component-type="s-search-result"]') or soup.select("div.s-result-item[data-asin]")
-    for d in cards:
+    for d in soup.select('div[data-component-type="s-search-result"]'):
         asin = (d.get("data-asin") or "").strip()
         h2 = d.select_one("h2")
         if not asin or not h2:
@@ -326,7 +320,36 @@ def run_check(dry_run: bool = False) -> None:
     requests_blocked = 0
     found: dict[str, dict] = {}
 
-    # 1) search pages - discover new listings
+    def check_products(asins: list[str]) -> None:
+        nonlocal requests_ok, requests_blocked
+        for asin in asins:
+            if requests_blocked:
+                return
+            try:
+                info = amz.product(asin)
+                requests_ok += 1
+            except Blocked:
+                requests_blocked += 1
+                return
+            finally:
+                amz.pause()
+            title = info["title"] or watch.get(asin, "")
+            info["title"] = title
+            if title and not is_relevant_title(title, india_only) and asin in state["discovered"]:
+                log(f"  {asin}: not a relevant card after all, skipping")
+                continue
+            log(f"product {asin}: {info['status']:<11} {info['price']:<10} {title[:70]}")
+            if info["status"] == "available":
+                found[asin] = info
+
+    # 1) product pages - authoritative availability. Checked first, so they get
+    #    through even if Amazon starts blocking later requests in this run.
+    asins = list(watch)
+    random.shuffle(asins)
+    check_products(asins)
+
+    # 2) search pages - discover new listings, then check the new ones right away
+    new_asins: list[str] = []
     queries = SEARCH_QUERIES[:]
     random.shuffle(queries)
     for q in queries:
@@ -347,29 +370,8 @@ def run_check(dry_run: bool = False) -> None:
                 log(f"  discovered new listing {r['asin']}: {r['title'][:80]}")
                 state["discovered"][r["asin"]] = r["title"][:100]
                 watch[r["asin"]] = r["title"][:100]
-
-    # 2) product pages - authoritative availability
-    asins = list(watch)
-    random.shuffle(asins)
-    for asin in asins:
-        if requests_blocked:
-            break
-        try:
-            info = amz.product(asin)
-            requests_ok += 1
-        except Blocked:
-            requests_blocked += 1
-            break
-        finally:
-            amz.pause()
-        title = info["title"] or watch.get(asin, "")
-        info["title"] = title
-        if info["title"] and not is_relevant_title(info["title"], india_only) and asin in state["discovered"]:
-            log(f"  {asin}: not a relevant card after all, skipping")
-            continue
-        log(f"product {asin}: {info['status']:<11} {info['price']:<10} {title[:70]}")
-        if info["status"] == "available":
-            found[asin] = info
+                new_asins.append(r["asin"])
+    check_products(new_asins)
 
     log(f"requests ok={requests_ok} blocked={requests_blocked}; available={len(found)}")
 
