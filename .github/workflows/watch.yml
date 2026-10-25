@@ -48,9 +48,10 @@ jobs:
         if: ${{ inputs.test_telegram }}
         run: python watcher.py --test
 
+      # one check, then ~4.5 minutes answering Telegram buttons/commands (/check, /status...)
       - name: Check Amazon.in
         if: ${{ !inputs.test_telegram }}
-        run: python watcher.py
+        run: python watcher.py --listen 270
 
       - name: Save state
         if: ${{ always() && hashFiles('state.json') != '' }}
