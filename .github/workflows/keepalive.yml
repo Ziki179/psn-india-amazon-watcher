@@ -1,0 +1,28 @@
+name: keepalive
+
+# GitHub disables scheduled workflows in public repos after 60 days without commits.
+# This makes an empty commit when the last commit is older than 45 days.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit if repo is idle
+        run: |
+          last=$(git log -1 --format=%ct)
+          age=$(( $(date +%s) - last ))
+          echo "last commit age: $((age/86400)) days"
+          if [ "$age" -gt $((45*86400)) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: keep scheduled watcher enabled"
+            git push
+          fi
