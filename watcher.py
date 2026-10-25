@@ -14,11 +14,18 @@ Environment variables:
   INDIA_ONLY           "true" (default) ignore listings for non-Indian stores (USD, UK, UAE...)
   STATE_FILE           path of the state file (default: state.json)
 
+  BOT_TIMEZONE         time zone for times shown in Telegram (default: Asia/Jerusalem)
+
+Telegram commands (only from the chat ids in TELEGRAM_CHAT_ID):
+  /check  check Amazon now and reply with what is available
+  /status last check result     /menu  buttons     /help  help
+
 Usage:
-  python watcher.py                 # one check (used by GitHub Actions)
-  python watcher.py --loop 120      # check every 120 seconds forever (run on your own PC/server)
+  python watcher.py                 # one check, no commands
+  python watcher.py --listen 280    # one check, then answer Telegram commands for 280 s (GitHub Actions)
+  python watcher.py --loop 300      # forever: check every 300 s and answer commands (own PC/server)
   python watcher.py --test          # send a test message to Telegram and exit
-  python watcher.py --dry-run       # check, print results, do not send anything
+  python watcher.py --dry-run       # do not send stock alerts
 """
 from __future__ import annotations
 
@@ -270,25 +277,113 @@ def parse_search(soup: BeautifulSoup) -> list[dict]:
 
 # --------------------------------------------------------------------------- telegram
 
-def telegram_send(text: str) -> None:
+TZ_NAME = os.environ.get("BOT_TIMEZONE", "Asia/Jerusalem")
+MANUAL_CHECK_COOLDOWN = 60  # seconds between manual checks
+
+
+def tg(method: str, **params):
+    """Call the Telegram Bot API. Returns the 'result' field, or None on error."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chats = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
-    if not token or not chats:
+    if not token:
+        return None
+    data = json.dumps(params).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=int(params.get("timeout", 0)) + 20) as r:
+            return json.loads(r.read()).get("result")
+    except Exception as e:
+        body = getattr(e, "read", lambda: b"")()
+        log(f"telegram {method} FAILED: {e} {body[:200]!r}")
+        return None
+
+
+def allowed_chats() -> list[str]:
+    return [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+
+
+def telegram_send(text: str, buttons: list | None = None, chat: str | int | None = None) -> None:
+    """Send a message (with optional inline buttons) to one chat, or to all configured chats."""
+    chats = [str(chat)] if chat is not None else allowed_chats()
+    if not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or not chats:
         log("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing - printing message instead:\n" + text)
         return
-    for chat in chats:
-        data = urllib.parse.urlencode({
-            "chat_id": chat, "text": text, "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }).encode()
-        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                r.read()
-            log(f"telegram: sent to {chat}")
-        except Exception as e:
-            body = getattr(e, "read", lambda: b"")()
-            log(f"telegram: FAILED for {chat}: {e} {body[:200]!r}")
+    for c in chats:
+        params = {"chat_id": c, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        if buttons:
+            params["reply_markup"] = {"inline_keyboard": buttons}
+        if tg("sendMessage", **params) is not None:
+            log(f"telegram: sent to {c}")
+
+
+# ---- texts & buttons (Hebrew UI)
+
+MENU_BUTTONS = [
+    [{"text": "🔄 בדוק עכשיו", "callback_data": "check"}],
+    [{"text": "📋 מצב אחרון", "callback_data": "status"}, {"text": "❓ עזרה", "callback_data": "help"}],
+]
+
+HELP_TEXT = (
+    "🤖 <b>בוט מעקב גיפט קארדים PSN – אמזון הודו</b>\n\n"
+    "הבוט בודק את Amazon.in כל כמה דקות ושולח התראה ברגע שיש גיפט קארד של PlayStation Store הודו במלאי.\n\n"
+    "<b>פקודות:</b>\n"
+    "/check – בדיקה עכשיו ומה זמין כרגע\n"
+    "/status – תוצאות הבדיקה האחרונה\n"
+    "/menu – תפריט הכפתורים\n"
+    "/help – ההסבר הזה\n\n"
+    "ℹ️ לפעמים אמזון חוסם בדיקה (בדיקת רובוט). במקרה כזה הבוט לא שולח התראה שגויה ומנסה שוב בבדיקה הבאה."
+)
+
+WELCOME_TEXT = "👋 <b>היי!</b> אני עוקב בשבילך אחרי גיפט קארדים של PlayStation Store הודו באמזון.\nבחר פעולה:"
+
+STATUS_ICON = {"available": "✅", "unavailable": "❌", "gone": "🚫", "unknown": "❔", "unchecked": "⚠️"}
+STATUS_TEXT = {"available": "זמין!", "unavailable": "אזל", "gone": "המוצר הוסר מאמזון",
+               "unknown": "לא ברור", "unchecked": "לא נבדק (אמזון חסם)"}
+
+
+def now_local() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(TZ_NAME))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def fmt_time(ts: float) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(ts, ZoneInfo(TZ_NAME)).strftime("%H:%M · %d/%m")
+    except Exception:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M UTC · %d/%m")
+
+
+def fmt_duration(seconds: float) -> str:
+    m = int(seconds // 60)
+    if m < 1:
+        return "פחות מדקה"
+    if m < 60:
+        return f"{m} דקות"
+    h, m = divmod(m, 60)
+    return f"{h} שעות ו-{m} דקות" if m else f"{h} שעות"
+
+
+AMOUNT_RE = re.compile(r"(?:rs\.?|inr|₹)\s*([\d,]{3,6})|([\d,]{3,6})\s*(?:rs|inr|₹)", re.I)
+
+
+def short_label(title: str, asin: str = "") -> str:
+    m = AMOUNT_RE.search(title or "")
+    if m:
+        amount = (m.group(1) or m.group(2)).replace(",", "")
+        return f"₹{int(amount):,}"
+    if re.search(r"e-?gift", title or "", re.I):
+        return "E-Gift Card"
+    return (title or asin)[:28]
+
+
+def buy_buttons(items: list[dict]) -> list:
+    rows = [[{"text": f"🛒 קנה {short_label(i['title'], i['asin'])}", "url": i["url"]}] for i in items[:8]]
+    rows.append([{"text": "🔄 בדוק שוב", "callback_data": "check"}])
+    return rows
 
 
 def fmt_item(it: dict) -> str:
@@ -306,9 +401,38 @@ def fmt_item(it: dict) -> str:
     return "\n".join(parts)
 
 
+def format_report(report: dict | None, title: str = "📋 <b>מצב המלאי</b>") -> tuple[str, list]:
+    """Full status list of every tracked card + buttons."""
+    if not report:
+        return ("עדיין לא בוצעה בדיקה. לחץ על \"בדוק עכשיו\".", MENU_BUTTONS)
+    items = sorted(report["items"].values(),
+                   key=lambda i: (i["status"] != "available", short_label(i["title"], i["asin"])))
+    lines = [f"{title} · {fmt_time(report['ts'])}", ""]
+    for i in items:
+        if i["status"] == "gone":
+            continue
+        icon = STATUS_ICON.get(i["status"], "❔")
+        label = html.escape(short_label(i["title"], i["asin"]))
+        line = f"{icon} <a href=\"{i['url']}\">{label}</a> – {STATUS_TEXT.get(i['status'], i['status'])}"
+        if i["status"] == "available" and i.get("price"):
+            line += f" ({html.escape(i['price'])})"
+        lines.append(line)
+    avail = [i for i in items if i["status"] == "available"]
+    lines.append("")
+    if avail:
+        lines.append(f"🟢 <b>{len(avail)} זמינים עכשיו!</b>")
+    else:
+        lines.append("🔴 אין כרגע גיפט קארד זמין.")
+    if report.get("blocked"):
+        lines.append("⚠️ אמזון חסם חלק מהבדיקות – התוצאה לא מלאה.")
+    buttons = buy_buttons(avail) if avail else MENU_BUTTONS
+    return "\n".join(lines), buttons
+
+
 # --------------------------------------------------------------------------- main check
 
-def run_check(dry_run: bool = False) -> None:
+def run_check(dry_run: bool = False, manual: bool = False) -> dict:
+    """Check Amazon, send alerts, save state. Returns a report of every tracked card."""
     alert_mode = os.environ.get("ALERT_MODE", "every").strip().lower()
     india_only = os.environ.get("INDIA_ONLY", "true").strip().lower() not in ("0", "false", "no")
 
@@ -316,6 +440,7 @@ def run_check(dry_run: bool = False) -> None:
     state.setdefault("discovered", {})
     state.setdefault("available", {})
     state.setdefault("blocked_streak", 0)
+    state["last_check_ts"] = now_ts()
 
     watch = load_watchlist()
     for asin, title in state["discovered"].items():
@@ -325,6 +450,7 @@ def run_check(dry_run: bool = False) -> None:
     requests_ok = 0
     requests_blocked = 0
     found: dict[str, dict] = {}
+    checked: dict[str, dict] = {}
 
     def check_products(asins: list[str]) -> None:
         nonlocal requests_ok, requests_blocked
@@ -345,6 +471,7 @@ def run_check(dry_run: bool = False) -> None:
                 log(f"  {asin}: not a relevant card after all, skipping")
                 continue
             log(f"product {asin}: {info['status']:<11} {info['price']:<10} {title[:70]}")
+            checked[asin] = info
             if info["status"] == "available":
                 found[asin] = info
 
@@ -380,24 +507,38 @@ def run_check(dry_run: bool = False) -> None:
     check_products(new_asins)
 
     log(f"requests ok={requests_ok} blocked={requests_blocked}; available={len(found)}")
+    partial = requests_blocked > 0
+
+    # report of every tracked card (used by /check and /status)
+    items = {}
+    for asin, note in watch.items():
+        if asin in checked:
+            i = checked[asin]
+            items[asin] = {"asin": asin, "title": i["title"], "status": i["status"],
+                           "price": i["price"], "url": i["url"]}
+        elif asin not in state["discovered"] or asin in state["available"]:
+            items[asin] = {"asin": asin, "title": note, "status": "unchecked", "price": "",
+                           "url": f"{BASE}/dp/{asin}"}
+    report = {"ts": now_ts(), "items": items, "blocked": partial, "manual": manual}
+    state["last_report"] = report
 
     # 3) blocked bookkeeping - a run that hit a CAPTCHA is incomplete
-    partial = requests_blocked > 0
     if partial:
         state["blocked_streak"] += 1
         log(f"run stopped by Amazon CAPTCHA (streak {state['blocked_streak']})")
         last = state.get("last_block_alert", 0)
-        if (state["blocked_streak"] >= BLOCK_ALERT_AFTER
+        if (not manual and state["blocked_streak"] >= BLOCK_ALERT_AFTER
                 and now_ts() - last > BLOCK_REALERT_SECONDS and not dry_run):
             telegram_send(
                 "⚠️ <b>Amazon חוסם את הבדיקות</b>\n"
-                f"{state['blocked_streak']} ריצות ברצף נחסמו (CAPTCHA). הבוט ימשיך לנסות בריצות הבאות.\n"
-                "אם זה נמשך יותר מכמה שעות - אפשר להריץ את הבוט מהמחשב שלך (ראה README)."
+                f"{state['blocked_streak']} בדיקות ברצף נחסמו (CAPTCHA). הבוט ימשיך לנסות.\n"
+                "אפשר תמיד לנסות ידנית עם /check.",
+                MENU_BUTTONS,
             )
             state["last_block_alert"] = now_ts()
         if not found:
             save_state(state)
-            return
+            return report
     else:
         if state["blocked_streak"] >= BLOCK_ALERT_AFTER and state.get("last_block_alert") and not dry_run:
             telegram_send("✅ הבדיקות מול Amazon חזרו לעבוד.")
@@ -410,22 +551,29 @@ def run_check(dry_run: bool = False) -> None:
     # only report "sold out" after a complete run, so an unchecked item isn't mistaken for sold out
     gone = [] if partial else [a for a in prev if a not in found]
 
-    messages = []
-    if found and (alert_mode == "every" or newly):
+    messages: list[tuple[str, list | None]] = []
+    # a manual check already shows the full list, so only real changes are announced
+    if found and ((alert_mode == "every" and not manual) or newly):
         header = "🟢 <b>יש גיפט קארד PSN זמין באמזון הודו!</b>"
-        if newly and alert_mode == "every" and len(newly) < len(found):
+        if newly and len(newly) < len(found):
             header += f"\n(חדש: {len(newly)})"
-        lines = [header, ""] + [fmt_item(found[a]) for a in sorted(found, key=lambda a: a not in newly)]
-        messages.append("\n".join(lines))
+        ordered = sorted(found, key=lambda a: a not in newly)
+        lines = [header, ""] + [fmt_item(found[a]) for a in ordered]
+        messages.append(("\n".join(lines), buy_buttons([found[a] for a in ordered])))
     if gone:
-        names = [html.escape(state["available"][a].get("title", a))[:80] for a in gone]
-        messages.append("🔴 <b>נגמר המלאי:</b>\n" + "\n".join(f"• {n}" for n in names))
+        lines = ["🔴 <b>נגמר המלאי:</b>"]
+        for a in gone:
+            info = state["available"][a]
+            label = html.escape(short_label(info.get("title", ""), a))
+            lasted = fmt_duration(now_ts() - info.get("since", now_ts()))
+            lines.append(f"• {label} – היה במלאי {lasted}")
+        messages.append(("\n".join(lines), None))
 
-    for m in messages:
+    for text, buttons in messages:
         if dry_run:
-            log("DRY RUN - would send:\n" + m)
+            log("DRY RUN - would send:\n" + text)
         else:
-            telegram_send(m)
+            telegram_send(text, buttons)
 
     new_avail = {a: {"title": i["title"], "price": i["price"],
                      "since": state["available"].get(a, {}).get("since", now_ts())}
@@ -435,27 +583,122 @@ def run_check(dry_run: bool = False) -> None:
     else:
         state["available"] = new_avail
     save_state(state)
+    return report
+
+
+# --------------------------------------------------------------------------- telegram commands
+
+COMMANDS = [
+    {"command": "check", "description": "בדיקה עכשיו – מה זמין כרגע"},
+    {"command": "status", "description": "תוצאות הבדיקה האחרונה"},
+    {"command": "menu", "description": "תפריט"},
+    {"command": "help", "description": "עזרה"},
+]
+
+
+def manual_check(chat, dry_run: bool = False) -> None:
+    state = load_state()
+    since = now_ts() - state.get("last_check_ts", 0)
+    if since < MANUAL_CHECK_COOLDOWN and state.get("last_report"):
+        text, buttons = format_report(state["last_report"])
+        telegram_send("⏳ בדיקה רצה לפני פחות מדקה, הנה התוצאה שלה:\n\n" + text, buttons, chat=chat)
+        return
+    telegram_send("🔎 בודק את אמזון הודו… (כחצי דקה)", chat=chat)
+    try:
+        report = run_check(dry_run, manual=True)
+    except Exception as e:
+        log(f"manual check failed: {e!r}")
+        telegram_send("❗ הבדיקה נכשלה. נסה שוב בעוד דקה.", MENU_BUTTONS, chat=chat)
+        return
+    text, buttons = format_report(report, "🔎 <b>בדיקה ידנית</b>")
+    telegram_send(text, buttons, chat=chat)
+
+
+def handle_update(u: dict, dry_run: bool = False) -> None:
+    chat = text = None
+    if "callback_query" in u:
+        cq = u["callback_query"]
+        tg("answerCallbackQuery", callback_query_id=cq["id"])
+        chat = cq.get("message", {}).get("chat", {}).get("id")
+        text = "/" + (cq.get("data") or "")
+    elif "message" in u:
+        chat = u["message"].get("chat", {}).get("id")
+        text = u["message"].get("text") or ""
+    if chat is None or not text:
+        return
+    if str(chat) not in allowed_chats():
+        log(f"ignoring message from unknown chat {chat}")
+        return
+    cmd = text.strip().split()[0].split("@")[0].lower()
+    log(f"command {cmd} from {chat}")
+    if cmd in ("/check", "/בדוק"):
+        manual_check(chat, dry_run)
+    elif cmd == "/status":
+        text_, buttons = format_report(load_state().get("last_report"))
+        telegram_send(text_, buttons, chat=chat)
+    elif cmd == "/help":
+        telegram_send(HELP_TEXT, MENU_BUTTONS, chat=chat)
+    else:  # /start, /menu, anything else
+        telegram_send(WELCOME_TEXT, MENU_BUTTONS, chat=chat)
+
+
+def serve(duration: float | None, interval: float, dry_run: bool = False) -> None:
+    """Answer Telegram commands, and run a scheduled check every `interval` seconds.
+    duration=None runs forever (own PC/server); on GitHub Actions each run listens ~5 minutes."""
+    end = time.time() + duration if duration else float("inf")
+    has_tg = bool(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip())
+    if has_tg:
+        tg("setMyCommands", commands=COMMANDS)
+    next_check = time.time()
+    while time.time() < end:
+        if time.time() >= next_check:
+            try:
+                run_check(dry_run)
+            except Exception as e:
+                log(f"check failed: {e!r}")
+            next_check = time.time() + interval
+        wait = min(end, next_check) - time.time()
+        if wait <= 0:
+            continue
+        if not has_tg:
+            time.sleep(wait)
+            continue
+        offset = load_state().get("tg_offset", 0)
+        updates = tg("getUpdates", offset=offset, timeout=int(max(1, min(25, wait))),
+                     allowed_updates=["message", "callback_query"])
+        if updates is None:
+            time.sleep(min(5, max(0, wait)))
+            continue
+        for u in updates:
+            st = load_state()
+            st["tg_offset"] = u["update_id"] + 1
+            save_state(st)
+            try:
+                handle_update(u, dry_run)
+            except Exception as e:
+                log(f"command failed: {e!r}")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--loop", type=int, metavar="SECONDS", help="repeat the check every N seconds")
+    ap.add_argument("--listen", type=int, metavar="SECONDS",
+                    help="check once, then answer Telegram commands for N seconds (GitHub Actions)")
+    ap.add_argument("--loop", type=int, metavar="SECONDS",
+                    help="run forever: check every N seconds and answer commands (own PC/server)")
     ap.add_argument("--test", action="store_true", help="send a Telegram test message and exit")
-    ap.add_argument("--dry-run", action="store_true", help="do not send Telegram messages")
+    ap.add_argument("--dry-run", action="store_true", help="do not send stock alerts")
     args = ap.parse_args()
 
     if args.test:
-        telegram_send("✅ בוט מעקב PSN אמזון הודו מחובר ועובד. תקבל כאן התראה כשיהיה גיפט קארד זמין.")
+        telegram_send("✅ בוט מעקב PSN אמזון הודו מחובר ועובד. תקבל כאן התראה כשיהיה גיפט קארד זמין.",
+                      MENU_BUTTONS)
         return 0
-
     if args.loop:
-        interval = max(60, args.loop)
-        while True:
-            try:
-                run_check(args.dry_run)
-            except Exception as e:  # keep looping
-                log(f"check failed: {e!r}")
-            time.sleep(interval + random.uniform(0, 20))
+        serve(None, max(60, args.loop), args.dry_run)
+        return 0
+    if args.listen:
+        serve(args.listen, float("inf"), args.dry_run)
+        return 0
     run_check(args.dry_run)
     return 0
 
