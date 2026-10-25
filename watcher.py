@@ -157,7 +157,7 @@ class Amazon:
         except Exception as e:  # network error
             log(f"  network error on {url}: {e}")
             status, text = 0, ""
-        if status in (0, 429, 503) or any(m in text for m in CAPTCHA_MARKERS):
+        if status in (0, 429, 503) or (status != 404 and any(m in text for m in CAPTCHA_MARKERS)):
             log(f"  blocked/captcha (status {status}) on {url} - stopping this run")
             raise Blocked(url)
         return status, text
@@ -184,7 +184,12 @@ class Amazon:
         status, text = self.get("/s?k=" + urllib.parse.quote_plus(query))
         if status != 200:
             return []
-        return parse_search(BeautifulSoup(text, "lxml"))
+        soup = BeautifulSoup(text, "lxml")
+        results = parse_search(soup)
+        if not results:
+            t = clean(soup.title.get_text()) if soup.title else ""
+            log(f"  search page had no results ({len(text)} bytes, title: {t[:80]})")
+        return results
 
 
 def first_text(soup: BeautifulSoup, selectors: list[str]) -> str:
@@ -244,7 +249,8 @@ def parse_product(soup: BeautifulSoup) -> dict:
 
 def parse_search(soup: BeautifulSoup) -> list[dict]:
     results = []
-    for d in soup.select('div[data-component-type="s-search-result"]'):
+    cards = soup.select('div[data-component-type="s-search-result"]') or soup.select("div.s-result-item[data-asin]")
+    for d in cards:
         asin = (d.get("data-asin") or "").strip()
         h2 = d.select_one("h2")
         if not asin or not h2:
