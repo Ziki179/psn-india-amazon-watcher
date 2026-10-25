@@ -1,0 +1,13 @@
+# ASINs of PlayStation Store (India) gift cards / PSN Wallet top-ups on amazon.in
+# One ASIN per line. Text after "#" is just a note. Add more any time.
+# The bot also searches amazon.in and adds new listings it finds automatically.
+
+B07K6PVXJZ  # Rs.500  Sony PlayStation Network Wallet Top-Up (official)
+B07K6RYVHR  # Rs.1000 Sony PlayStation Store Gift Card (official)
+B093QF35KZ  # Rs.2000 Sony PlayStation Store Gift Card (official)
+B07K6RYVJ5  # Rs.4000 Sony PlayStation Store Gift Card (official)
+B0CYP97QKQ  # Rs.12000 Sony PlayStation Network Wallet Top-Up
+B0C1H473H8  # PlayStation E-Gift Card (Amazon gift-card store, any amount)
+B0FLPRQ4GF  # PlayStation Wallet INR 3000 (Digital Code)
+B0FLPSFWJL  # PlayStation Wallet INR 5000 (Digital Code)
+B0HF8DRJ3D  # Rs.15000 PSN Wallet Top-Up (3rd-party seller)
