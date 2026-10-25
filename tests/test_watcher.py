@@ -97,7 +97,7 @@ def run(monkeypatch, tmp_path, pages, mode="every"):
     sent = []
     FakeAmazon.pages = pages
     monkeypatch.setattr(watcher, "Amazon", FakeAmazon)
-    monkeypatch.setattr(watcher, "telegram_send", lambda t: sent.append(t))
+    monkeypatch.setattr(watcher, "telegram_send", lambda t, *a, **k: sent.append(t))
     monkeypatch.setattr(watcher, "STATE_FILE", tmp_path / "state.json")
     wl = tmp_path / "watchlist.txt"
     wl.write_text("B07K6RYVHR # 1000\nB093QF35KZ # 2000\n")
@@ -158,3 +158,112 @@ def test_partial_block_keeps_found_and_no_false_soldout(monkeypatch, tmp_path):
     pages = {"/s?k=": (200, "<html></html>"), "/dp/": (200, CAPTCHA_PAGE)}
     sent, st = run(monkeypatch, tmp_path, pages)
     assert sent == [] and "B093QF35KZ" in st["available"] and st["blocked_streak"] == 1
+
+
+def test_404_is_not_captcha(monkeypatch):
+    class R:
+        status_code = 404
+        text = "<html>Sorry! We couldn't find that page. api-services-support@amazon.com</html>"
+    a = watcher.Amazon()
+    monkeypatch.setattr(a.s, "get", lambda *k, **kw: R())
+    assert a.get("/dp/B0FLPSFWJL")[0] == 404
+
+
+def test_short_label():
+    assert watcher.short_label("Rs.1000 Sony PlayStation Store Gift Card") == "₹1,000"
+    assert watcher.short_label("PlayStation Wallet INR 5000 (Digital Code)") == "₹5,000"
+    assert watcher.short_label("RS.15000 PSN Wallet Top-Up Redeem Key") == "₹15,000"
+    assert watcher.short_label("Playstation | E-Gift Card | Instant Delivery") == "E-Gift Card"
+
+
+def test_report_and_buttons(monkeypatch, tmp_path):
+    pages = {"/s?k=": (200, "<html></html>"), "/dp/B07K6RYVHR": (200, OOS_PAGE), "/dp/B093QF35KZ": (200, IN_STOCK_PAGE)}
+    sent, st = run(monkeypatch, tmp_path, pages)
+    rep = st["last_report"]
+    assert rep["items"]["B093QF35KZ"]["status"] == "available"
+    assert rep["items"]["B07K6RYVHR"]["status"] == "unavailable"
+    text, buttons = watcher.format_report(rep)
+    assert "₹2,000" in text and "זמינים עכשיו" in text
+    assert buttons[0][0]["url"].endswith("/dp/B093QF35KZ")
+    # blocked run -> items marked unchecked
+    sent, st = run(monkeypatch, tmp_path, {"/": (200, CAPTCHA_PAGE)})
+    assert all(i["status"] == "unchecked" for i in st["last_report"]["items"].values())
+    text, _ = watcher.format_report(st["last_report"])
+    assert "חסם" in text
+
+
+def setup_cmd(monkeypatch, tmp_path, pages):
+    sent = []
+    FakeAmazon.pages = pages
+    monkeypatch.setattr(watcher, "Amazon", FakeAmazon)
+    monkeypatch.setattr(watcher, "telegram_send", lambda t, b=None, chat=None: sent.append((t, b, chat)))
+    monkeypatch.setattr(watcher, "tg", lambda *a, **k: True)
+    monkeypatch.setattr(watcher, "STATE_FILE", tmp_path / "state.json")
+    wl = tmp_path / "watchlist.txt"
+    wl.write_text("B07K6RYVHR # Rs.1000\nB093QF35KZ # Rs.2000\n")
+    monkeypatch.setattr(watcher, "WATCHLIST_FILE", wl)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "111")
+    monkeypatch.setenv("ALERT_MODE", "every")
+    return sent
+
+
+def test_manual_check_command(monkeypatch, tmp_path):
+    pages = {"/s?k=": (200, "<html></html>"), "/dp/B07K6RYVHR": (200, OOS_PAGE), "/dp/B093QF35KZ": (200, IN_STOCK_PAGE)}
+    sent = setup_cmd(monkeypatch, tmp_path, pages)
+    watcher.handle_update({"update_id": 1, "message": {"chat": {"id": 111}, "text": "/check"}})
+    texts = [t for t, b, c in sent]
+    # "checking..." + new-stock alert (to all chats) + the manual report to the asking chat
+    assert "בודק" in texts[0]
+    assert any("בדיקה ידנית" in t and "₹2,000" in t for t in texts)
+    assert sent[-1][2] == 111
+    # second /check within a minute -> cached result, no new Amazon requests
+    sent.clear()
+    watcher.handle_update({"update_id": 2, "callback_query": {"id": "x", "data": "check", "message": {"chat": {"id": 111}}}})
+    assert len(sent) == 1 and "פחות מדקה" in sent[0][0]
+
+
+def test_unknown_chat_ignored_and_menu(monkeypatch, tmp_path):
+    sent = setup_cmd(monkeypatch, tmp_path, {})
+    watcher.handle_update({"update_id": 1, "message": {"chat": {"id": 999}, "text": "/check"}})
+    assert sent == []
+    watcher.handle_update({"update_id": 2, "message": {"chat": {"id": 111}, "text": "/start"}})
+    assert sent and sent[0][1] == watcher.MENU_BUTTONS
+    sent.clear()
+    watcher.handle_update({"update_id": 3, "message": {"chat": {"id": 111}, "text": "/status"}})
+    assert "עדיין לא בוצעה בדיקה" in sent[0][0]
+
+
+def test_sold_out_shows_duration(monkeypatch, tmp_path):
+    pages = {"/s?k=": (200, "<html></html>"), "/dp/B07K6RYVHR": (200, OOS_PAGE), "/dp/B093QF35KZ": (200, IN_STOCK_PAGE)}
+    run(monkeypatch, tmp_path, pages)
+    st = json.loads((tmp_path / "state.json").read_text())
+    st["available"]["B093QF35KZ"]["since"] -= 3 * 3600 + 120
+    (tmp_path / "state.json").write_text(json.dumps(st))
+    pages["/dp/B093QF35KZ"] = (200, OOS_PAGE)
+    sent, st = run(monkeypatch, tmp_path, pages)
+    assert len(sent) == 1 and "3 שעות ו-2 דקות" in sent[0]
+
+
+def test_serve_listen_loop(monkeypatch, tmp_path):
+    pages = {"/s?k=": (200, "<html></html>"), "/dp/": (200, OOS_PAGE)}
+    sent = setup_cmd(monkeypatch, tmp_path, pages)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    calls = {"n": 0}
+
+    def fake_tg(method, **k):
+        if method == "getUpdates":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                assert k["offset"] == 0
+                return [{"update_id": 41, "message": {"chat": {"id": 111}, "text": "/help"}}]
+            assert k["offset"] == 42
+            raise SystemExit  # stop the loop
+        return True
+    monkeypatch.setattr(watcher, "tg", fake_tg)
+    try:
+        watcher.serve(300, float("inf"))
+    except SystemExit:
+        pass
+    st = json.loads((tmp_path / "state.json").read_text())
+    assert st["tg_offset"] == 42 and "last_report" in st
+    assert any("פקודות" in t for t, b, c in sent)
