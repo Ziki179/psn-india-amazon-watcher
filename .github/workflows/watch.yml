@@ -1,0 +1,60 @@
+name: PSN India watcher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay runs by a few minutes)
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Only send a Telegram test message"
+        type: boolean
+        default: false
+
+concurrency:
+  group: psn-watcher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ALERT_MODE: ${{ vars.ALERT_MODE || 'every' }}
+      INDIA_ONLY: ${{ vars.INDIA_ONLY || 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: state-
+
+      - name: Telegram test message
+        if: ${{ inputs.test_telegram }}
+        run: python watcher.py --test
+
+      - name: Check Amazon.in
+        if: ${{ !inputs.test_telegram }}
+        run: python watcher.py
+
+      - name: Save state
+        if: ${{ always() && hashFiles('state.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
